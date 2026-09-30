@@ -440,7 +440,9 @@ func toolsComplete(dir string) bool {
 	for _, name := range []string{"ffmpeg.exe", "ffprobe.exe", "ffplay.exe"} {
 		p := filepath.Join(dir, name)
 		st, err := os.Stat(p)
-		if err != nil || st.IsDir() || st.Size() < 1*1024*1024 {
+		// FFmpeg shared builds can have small .exe files because most of the
+		// runtime is stored in DLLs. Presence is the correct validation here.
+		if err != nil || st.IsDir() || st.Size() == 0 {
 			return false
 		}
 	}
