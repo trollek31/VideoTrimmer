@@ -38,7 +38,7 @@ jobs:
           $ffprobe = Get-ChildItem $check -Recurse -Filter 'ffprobe.exe' | Select-Object -First 1
           $ffplay = Get-ChildItem $check -Recurse -Filter 'ffplay.exe' | Select-Object -First 1
           if (-not $ffmpeg -or -not $ffprobe -or -not $ffplay) { throw 'Portable runtime is missing FFmpeg/FFprobe/FFplay.' }
-          & $ffmpeg.FullName -hide_banner -version | Select-Object -First 1
+          & $ffmpeg.FullName -hide_banner -version
           if ($LASTEXITCODE -ne 0) { throw 'FFmpeg failed to start.' }
           $test = "$env:RUNNER_TEMP\videotrimmer-test.mp4"
           $copy = "$env:RUNNER_TEMP\videotrimmer-copy.mp4"
