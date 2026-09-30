@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -114,32 +115,50 @@ const (
 	MB_ICONINFORMATION = 0x00000040
 
 	SW_SHOWNORMAL = 1
-	VK_SPACE      = 0x20
-	VK_O          = 0x4F
-	VK_S          = 0x53
-	VK_CONTROL    = 0x11
+
+	IMAGE_BITMAP        = 0
+	LR_LOADFROMFILE     = 0x00000010
+	LR_CREATEDIBSECTION = 0x00002000
+	SRCCOPY             = 0x00CC0020
+	HALFTONE            = 4
+	VK_SPACE            = 0x20
+	VK_O                = 0x4F
+	VK_S                = 0x53
+	VK_CONTROL          = 0x11
 )
 
 // A small, hand-drawn design system. RGB values are written in Win32's BGR COLORREF order.
 const (
-	BG       = 0x000B1016
-	SURFACE  = 0x00131A23
-	SURFACE2 = 0x0018202B
-	SURFACE3 = 0x00202A36
-	BORDER   = 0x002A3745
-	TEXT     = 0x00EFF4FA
-	MUTED    = 0x0098A6B5
-	ACCENT   = 0x0069E6A8
-	ACCENT2  = 0x0058B9FF
-	WHITE    = 0x00FFFFFF
-	BLACK    = 0x00000000
-	RED      = 0x004C596A
-	ORANGE   = 0x0052A6FF
-	EDIT_BG  = 0x00141C25
+	// Refined dark UI palette. Values are COLORREF/BGR.
+	BG             = 0x000D1117
+	SURFACE        = 0x00151B23
+	SURFACE2       = 0x0010171F
+	SURFACE3       = 0x001D2631
+	BORDER         = 0x002A3542
+	TEXT           = 0x00F3F7FB
+	MUTED          = 0x008B98A9
+	ACCENT         = 0x0079F0B0
+	ACCENT2        = 0x0068ABFF
+	WHITE          = 0x00FFFFFF
+	BLACK          = 0x00000000
+	RED            = 0x005E6675
+	ORANGE         = 0x006CB8FF
+	EDIT_BG        = 0x000F151C
+	ACCENT_HOVER   = 0x0087F7B9
+	ACCENT_PRESSED = 0x0068DCA2
 )
 
 type POINT struct{ X, Y int32 }
 type RECT struct{ Left, Top, Right, Bottom int32 }
+type BITMAP struct {
+	BmType       int32
+	BmWidth      int32
+	BmHeight     int32
+	BmWidthBytes int32
+	BmPlanes     uint16
+	BmBitsPixel  uint16
+	BmBits       uintptr
+}
 
 type PAINTSTRUCT struct {
 	Hdc         uintptr
@@ -253,6 +272,13 @@ type AppState struct {
 	fontSmall    uintptr
 	fontButton   uintptr
 	fontMono     uintptr
+
+	previewBitmap     uintptr
+	previewGeneration uint64
+	previewRequest    uint64
+	previewMu         sync.Mutex
+	playStartedAt     time.Time
+	playBase          float64
 }
 
 var state = &AppState{}
@@ -308,6 +334,12 @@ var (
 	procDrawText                     = user32.NewProc("DrawTextW")
 	procCreateFont                   = gdi32.NewProc("CreateFontW")
 	procGetStockObject               = gdi32.NewProc("GetStockObject")
+	procLoadImage                    = user32.NewProc("LoadImageW")
+	procGetObject                    = gdi32.NewProc("GetObjectW")
+	procCreateCompatibleDC           = gdi32.NewProc("CreateCompatibleDC")
+	procDeleteDC                     = gdi32.NewProc("DeleteDC")
+	procStretchBlt                   = gdi32.NewProc("StretchBlt")
+	procSetStretchBltMode            = gdi32.NewProc("SetStretchBltMode")
 	procLoadCursor                   = user32.NewProc("LoadCursorW")
 	procChooseOpen                   = comdlg32.NewProc("GetOpenFileNameW")
 	procChooseSave                   = comdlg32.NewProc("GetSaveFileNameW")
@@ -582,12 +614,12 @@ func createBrush(color uintptr) uintptr {
 }
 
 func initFonts() {
-	state.fontTitle = makeFont(-24, FW_SEMIBOLD, "Segoe UI")
-	state.fontSubtitle = makeFont(-13, FW_NORMAL, "Segoe UI")
-	state.fontBody = makeFont(-14, FW_NORMAL, "Segoe UI")
+	state.fontTitle = makeFont(-26, FW_SEMIBOLD, "Segoe UI")
+	state.fontSubtitle = makeFont(-14, FW_NORMAL, "Segoe UI")
+	state.fontBody = makeFont(-15, FW_NORMAL, "Segoe UI")
 	state.fontSmall = makeFont(-12, FW_MEDIUM, "Segoe UI")
-	state.fontButton = makeFont(-13, FW_SEMIBOLD, "Segoe UI")
-	state.fontMono = makeFont(-13, FW_MEDIUM, "Cascadia Mono")
+	state.fontButton = makeFont(-14, FW_SEMIBOLD, "Segoe UI")
+	state.fontMono = makeFont(-14, FW_MEDIUM, "Cascadia Mono")
 }
 
 func makeFont(height, weight int32, face string) uintptr {
@@ -679,8 +711,9 @@ var (
 )
 
 func makeEdit(parent uintptr, id uintptr, text string) uintptr {
+	// Flat edit control: the rounded card is painted by the parent window.
 	style := uint32(WS_CHILD|WS_VISIBLE) | 0x0001 | 0x0080 // ES_CENTER + ES_AUTOHSCROLL
-	h := createWindow("EDIT", text, style, WS_EX_CLIENTEDGE, 0, 0, 120, 34, parent, id, 0)
+	h := createWindow("EDIT", text, style, 0, 0, 0, 120, 34, parent, id, 0)
 	if h != 0 {
 		procSendMessage.Call(h, WM_SETFONT, state.fontMono, 1)
 	}
@@ -701,6 +734,10 @@ func buildUI(hwnd uintptr) {
 }
 
 var (
+	layoutPreviewY, layoutPreviewH   int32
+	layoutTimelineY, layoutTimelineH int32
+	layoutControlsY, layoutControlsH int32
+
 	rectOpen      RectF
 	rectPlay      RectF
 	rectSave      RectF
@@ -710,45 +747,51 @@ var (
 )
 
 func layoutUI(hwnd uintptr, width, height int32) {
-	if width < 980 {
-		width = 980
+	if width < 1120 {
+		width = 1120
 	}
-	if height < 680 {
-		height = 680
+	if height < 760 {
+		height = 760
 	}
-	margin := int32(26)
-	headerH := int32(72)
-	previewY := headerH
-	timelineH := int32(96)
-	controlsH := int32(88)
-	footerH := int32(60)
+
+	margin := int32(30)
+	previewY := int32(92)
+	timelineH := int32(150)
+	controlsH := int32(112)
+	footerH := int32(32)
 	gap := int32(14)
-	previewH := height - headerH - timelineH - controlsH - footerH - gap*3
+	previewH := height - previewY - timelineH - controlsH - footerH - gap*3
 	if previewH < 300 {
 		previewH = 300
 	}
-	previewW := width - margin*2
-	procMoveWindow.Call(state.preview, uintptr(margin), uintptr(previewY), uintptr(previewW), uintptr(previewH), 1)
+	contentW := width - margin*2
 
-	tlY := previewY + previewH + gap
-	procMoveWindow.Call(state.timeline, uintptr(margin), uintptr(tlY), uintptr(previewW), uintptr(timelineH), 1)
+	layoutPreviewY, layoutPreviewH = previewY, previewH
+	layoutTimelineY, layoutTimelineH = previewY+previewH+gap, timelineH
+	tlY := layoutTimelineY
+	layoutControlsY, layoutControlsH = tlY+timelineH+gap, controlsH
 
-	controlsY := tlY + timelineH + gap
-	fieldW := int32(140)
-	fieldH := int32(36)
-	procMoveWindow.Call(state.startEdit, uintptr(margin+116), uintptr(controlsY+24), uintptr(fieldW), uintptr(fieldH), 1)
-	procMoveWindow.Call(state.endEdit, uintptr(margin+274), uintptr(controlsY+24), uintptr(fieldW), uintptr(fieldH), 1)
+	procMoveWindow.Call(state.preview, uintptr(margin+2), uintptr(previewY+32), uintptr(contentW-4), uintptr(previewH-34), 1)
+	procMoveWindow.Call(state.timeline, uintptr(margin+2), uintptr(tlY+58), uintptr(contentW-4), uintptr(timelineH-60), 1)
 
-	rectOpen = RectF{float64(width - 190), 16, 156, 40}
-	rectPlay = RectF{float64(margin), float64(controlsY + 24), 104, 36}
-	rectReset = RectF{float64(margin + 228), float64(controlsY + 24), 72, 36}
-	rectModeGroup = RectF{float64(margin + 514), float64(controlsY + 8), 220, 58}
-	rectSave = RectF{float64(width - 200), float64(controlsY + 18), 174, 46}
-	rectFolder = RectF{float64(width - 170), float64(controlsY + 94), 144, 32}
+	controlsY := layoutControlsY
+	fieldW := int32(154)
+	fieldH := int32(40)
+	procMoveWindow.Call(state.startEdit, uintptr(margin+112), uintptr(controlsY+50), uintptr(fieldW), uintptr(fieldH), 1)
+	procMoveWindow.Call(state.endEdit, uintptr(margin+284), uintptr(controlsY+50), uintptr(fieldW), uintptr(fieldH), 1)
+
+	// Compact control row sized to fit even at the minimum window width.
+	rectPlay = RectF{float64(margin + 468), float64(controlsY + 50), 90, 40}
+	rectReset = RectF{float64(margin + 566), float64(controlsY + 50), 80, 40}
+	rectModeGroup = RectF{float64(margin + 656), float64(controlsY + 38), 220, 60}
+	rectSave = RectF{float64(width - margin - 172), float64(controlsY + 38), 172, 48}
+	rectOpen = RectF{float64(width - margin - 172), 20, 172, 40}
+	// Keep the output-folder action above the footer so it never overlaps status text.
+	rectFolder = RectF{float64(width - margin - 170), float64(controlsY + 6), 170, 28}
+
 	procInvalidateRect.Call(hwnd, 0, 1)
 	resizePlayerWindow()
 }
-
 func rectContains(r RectF, x, y int32) bool {
 	return float64(x) >= r.x && float64(x) <= r.x+r.w && float64(y) >= r.y && float64(y) <= r.y+r.h
 }
@@ -775,38 +818,77 @@ func drawPreview(hwnd uintptr) {
 	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	var r RECT
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
-	fill(hdc, r, SURFACE2)
+	fill(hdc, r, BLACK)
 
 	state.mu.Lock()
 	file := state.currentFile
 	duration := state.duration
+	status := state.status
 	state.mu.Unlock()
-	if file != "" && duration > 0 {
-		state.playerMu.Lock()
-		ph := state.playerWindow
-		state.playerMu.Unlock()
-		if ph != 0 {
-			return
-		}
-		state.mu.Lock()
-		status := state.status
-		state.mu.Unlock()
-		label := "Загрузка предпросмотра…"
-		if status == "Предпросмотр недоступен" || strings.HasPrefix(status, "Не удалось запустить предпросмотр") {
-			label = "Предпросмотр недоступен"
-		}
-		drawText(hdc, label, RECT{r.Left + 20, cyForPreview(r) - 12, r.Right - 20, cyForPreview(r) + 18}, MUTED, state.fontSubtitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	state.playerMu.Lock()
+	active := state.player != nil
+	embedded := state.playerWindow != 0
+	state.playerMu.Unlock()
+	// Keep the thumbnail visible until the ffplay window is actually embedded.
+	state.previewMu.Lock()
+	bmp := state.previewBitmap
+	if file != "" && duration > 0 && active && embedded {
+		state.previewMu.Unlock()
 		return
 	}
+	if bmp != 0 {
+		// Hold previewMu for the entire GDI draw so a worker goroutine cannot delete
+		// the bitmap while it is selected into the temporary DC.
+		drawPreviewBitmap(hdc, r, bmp)
+		state.previewMu.Unlock()
+		line(hdc, 0, r.Bottom-1, r.Right, r.Bottom-1, ACCENT, 1)
+		return
+	}
+	state.previewMu.Unlock()
+
 	cx := (r.Left + r.Right) / 2
-	cy := (r.Top+r.Bottom)/2 - 16
-	circle := createBrush(rgb(33, 44, 58))
-	procSelectObject.Call(hdc, circle)
-	procEllipse.Call(hdc, uintptr(cx-34), uintptr(cy-34), uintptr(cx+34), uintptr(cy+34))
-	procDeleteObject.Call(circle)
-	drawText(hdc, "▶", RECT{cx - 14, cy - 16, cx + 14, cy + 16}, ACCENT, state.fontTitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, "Перетащите MP4 сюда", RECT{r.Left + 20, cy + 54, r.Right - 20, cy + 82}, TEXT, state.fontTitle, DT_CENTER|DT_SINGLELINE)
-	drawText(hdc, "или нажмите «Открыть видео» сверху", RECT{r.Left + 20, cy + 88, r.Right - 20, cy + 112}, MUTED, state.fontSubtitle, DT_CENTER|DT_SINGLELINE)
+	cy := (r.Top + r.Bottom) / 2
+	cardW := int32(430)
+	cardH := int32(176)
+	box := RECT{cx - cardW/2, cy - cardH/2, cx + cardW/2, cy + cardH/2}
+	roundRect(hdc, box, SURFACE, BORDER, 22)
+	roundRect(hdc, RECT{cx - 42, box.Top + 20, cx + 42, box.Top + 84}, SURFACE3, BORDER, 16)
+	drawText(hdc, "▶", RECT{cx - 24, box.Top + 28, cx + 24, box.Top + 76}, ACCENT, state.fontTitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	if file != "" && duration > 0 {
+		drawText(hdc, "Подготавливаю предпросмотр", RECT{box.Left + 18, box.Top + 98, box.Right - 18, box.Top + 127}, TEXT, state.fontBody, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, status, RECT{box.Left + 22, box.Top + 132, box.Right - 22, box.Bottom - 16}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+	} else {
+		drawText(hdc, "Перетащите MP4 сюда", RECT{box.Left + 18, box.Top + 98, box.Right - 18, box.Top + 127}, TEXT, state.fontTitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+		drawText(hdc, "или нажмите «Открыть видео»", RECT{box.Left + 18, box.Top + 132, box.Right - 18, box.Bottom - 16}, MUTED, state.fontSubtitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	}
+}
+
+func drawPreviewBitmap(hdc uintptr, r RECT, bmp uintptr) {
+	var bm BITMAP
+	if v, _, _ := procGetObject.Call(bmp, unsafe.Sizeof(bm), uintptr(unsafe.Pointer(&bm))); v == 0 || bm.BmWidth <= 0 || bm.BmHeight <= 0 {
+		return
+	}
+	w := float64(r.Right - r.Left)
+	h := float64(r.Bottom - r.Top)
+	bw := float64(bm.BmWidth)
+	bh := float64(bm.BmHeight)
+	scale := w / bw
+	if v := h / bh; v < scale {
+		scale = v
+	}
+	dw := int32(math.Round(bw * scale))
+	dh := int32(math.Round(bh * scale))
+	dx := (r.Right - r.Left - dw) / 2
+	dy := (r.Bottom - r.Top - dh) / 2
+	mem, _, _ := procCreateCompatibleDC.Call(hdc)
+	if mem == 0 {
+		return
+	}
+	defer procDeleteDC.Call(mem)
+	old, _, _ := procSelectObject.Call(mem, bmp)
+	procSetStretchBltMode.Call(hdc, HALFTONE)
+	procStretchBlt.Call(hdc, uintptr(dx), uintptr(dy), uintptr(dw), uintptr(dh), mem, 0, 0, uintptr(bm.BmWidth), uintptr(bm.BmHeight), SRCCOPY)
+	procSelectObject.Call(mem, old)
 }
 
 func drawMain(hwnd uintptr, hdc uintptr) {
@@ -814,15 +896,14 @@ func drawMain(hwnd uintptr, hdc uintptr) {
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
 	fill(hdc, r, BG)
 
-	// Header
-	roundRect(hdc, RECT{18, 14, 64, 60}, SURFACE3, BORDER, 12)
-	drawText(hdc, "▶", RECT{18, 21, 64, 54}, ACCENT, state.fontTitle, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, appName, RECT{76, 17, 290, 44}, TEXT, state.fontTitle, DT_SINGLELINE)
-	drawText(hdc, "Быстрая обрезка • без лишнего", RECT{76, 44, 330, 66}, MUTED, state.fontSubtitle, DT_SINGLELINE)
+	// Header bar.
+	roundRect(hdc, RECT{22, 12, r.Right - 22, 74}, SURFACE, BORDER, 18)
+	roundRect(hdc, RECT{38, 23, 82, 63}, SURFACE3, BORDER, 12)
+	drawText(hdc, "VT", RECT{38, 23, 82, 63}, ACCENT, state.fontButton, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, "Video Trimmer", RECT{98, 18, 300, 43}, TEXT, state.fontTitle, DT_SINGLELINE)
+	drawText(hdc, "Быстрый и точный монтаж MP4", RECT{98, 45, 330, 65}, MUTED, state.fontSmall, DT_SINGLELINE)
+	buttonDraw(hdc, rectOpen, BTN_OPEN, "＋  Открыть видео", ACCENT2, true)
 
-	buttonDraw(hdc, rectOpen, BTN_OPEN, "Открыть видео", ACCENT2, true)
-
-	// The preview/timeline are child windows; this layer draws the shell around them.
 	state.mu.Lock()
 	file := state.currentFile
 	progress := state.progress
@@ -832,102 +913,145 @@ func drawMain(hwnd uintptr, hdc uintptr) {
 	metaLine := state.metaLine
 	out := state.lastOutput
 	state.mu.Unlock()
-	_ = file
 
-	tdraw := func(s string, rr RECT, color uintptr, f uintptr, flags int32) { drawText(hdc, s, rr, color, f, flags) }
+	// Small status pill in header.
+	pillText := "Готово"
+	var pillColor uintptr = ACCENT
+	if running {
+		pillText = "Обработка"
+		pillColor = ACCENT2
+	}
+	if file == "" && !running {
+		pillText = "Нет видео"
+		pillColor = MUTED
+	}
+	roundRect(hdc, RECT{340, 25, 448, 60}, SURFACE2, BORDER, 17)
+	drawText(hdc, "●", RECT{350, 27, 367, 58}, pillColor, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, pillText, RECT{370, 27, 443, 58}, TEXT, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
 
-	var prevRect RECT
-	procGetClientRect.Call(state.preview, uintptr(unsafe.Pointer(&prevRect)))
-	previewH := prevRect.Bottom
-	timelineY := int32(78) + previewH + 16
-	controlsY := timelineY + 108 + 0 + 0 + 0
-	infoY := controlsY
+	// Preview shell. The child preview is intentionally inset so this header stays visible.
+	previewY, previewH := layoutPreviewY, layoutPreviewH
+	roundRect(hdc, RECT{26, previewY - 2, r.Right - 26, previewY + previewH}, SURFACE2, BORDER, 20)
+	drawText(hdc, "ПРЕДПРОСМОТР", RECT{46, previewY + 8, 200, previewY + 31}, MUTED, state.fontSmall, DT_SINGLELINE)
+	if file != "" {
+		drawText(hdc, filepath.Base(file), RECT{204, previewY + 8, r.Right - 48, previewY + 31}, TEXT, state.fontSmall, DT_END_ELLIPSIS|DT_SINGLELINE|0x00000002)
+	}
 
-	// Time fields
-	tdraw("НАЧАЛО", RECT{142, infoY - 4, 296, infoY + 18}, MUTED, state.fontSmall, 0)
-	tdraw("КОНЕЦ", RECT{300, infoY - 4, 454, infoY + 18}, MUTED, state.fontSmall, 0)
-	inputCard(hdc, RectF{142, float64(infoY + 20), 154, 36})
-	inputCard(hdc, RectF{300, float64(infoY + 20), 140, 36})
+	// Timeline shell.
+	timelineY, timelineH := layoutTimelineY, layoutTimelineH
+	roundRect(hdc, RECT{26, timelineY - 2, r.Right - 26, timelineY + timelineH}, SURFACE, BORDER, 20)
+	drawText(hdc, "ОБРЕЗКА", RECT{46, timelineY + 10, 132, timelineY + 31}, MUTED, state.fontSmall, DT_SINGLELINE)
+	drawText(hdc, "Перетаскивайте маркеры на шкале или задайте время вручную ниже", RECT{46, timelineY + 31, r.Right - 46, timelineY + 52}, MUTED, state.fontSmall, DT_SINGLELINE|DT_END_ELLIPSIS)
 
-	buttonDraw(hdc, rectPlay, BTN_PLAY, "▶  Пуск", ACCENT2, false)
+	// Controls shell.
+	controlsY, controlsH := layoutControlsY, layoutControlsH
+	roundRect(hdc, RECT{26, controlsY - 2, r.Right - 26, controlsY + controlsH}, SURFACE, BORDER, 20)
+	drawText(hdc, "ДИАПАЗОН", RECT{48, controlsY + 10, 132, controlsY + 31}, MUTED, state.fontSmall, DT_SINGLELINE)
+	drawText(hdc, "Начало", RECT{48, controlsY + 36, 102, controlsY + 52}, MUTED, state.fontSmall, DT_SINGLELINE)
+	drawText(hdc, "Конец", RECT{230, controlsY + 36, 284, controlsY + 52}, MUTED, state.fontSmall, DT_SINGLELINE)
+	inputCard(hdc, RectF{140, float64(controlsY + 31), 154, 42})
+	inputCard(hdc, RectF{322, float64(controlsY + 31), 154, 42})
+
+	playTitle := "▶  Пуск"
+	if state.playing {
+		playTitle = "Ⅱ  Пауза"
+	}
+	buttonDraw(hdc, rectPlay, BTN_PLAY, playTitle, ACCENT2, false)
 	buttonDraw(hdc, rectReset, BTN_RESET, "Сброс", SURFACE3, false)
 	modeGroupDraw(hdc, rectModeGroup, exact)
-	buttonDraw(hdc, rectSave, BTN_SAVE, "Сохранить", ACCENT, true)
-
-	// Status bar
-	statusY := infoY + 74
-	if running {
-		status = "Обработка видео…"
+	buttonDraw(hdc, rectSave, BTN_SAVE, "Сохранить MP4", ACCENT, true)
+	if out != "" && !running {
+		buttonDraw(hdc, rectFolder, BTN_OPEN_FOLDER, "Открыть папку", SURFACE3, false)
 	}
+
+	// Footer / file info.
+	statusY := r.Bottom - 30
 	var statusColor uintptr = MUTED
 	if strings.HasPrefix(status, "Видео успешно") {
 		statusColor = ACCENT
 	}
-	drawText(hdc, status, RECT{26, statusY, int32(r.Right - 26), statusY + 22}, statusColor, state.fontSmall, 0)
+	if running {
+		status = "Идёт обработка видео…"
+		statusColor = ACCENT2
+	}
+	drawText(hdc, "●", RECT{28, statusY - 2, 46, statusY + 17}, statusColor, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, status, RECT{52, statusY - 2, r.Right - 410, statusY + 17}, statusColor, state.fontSmall, DT_END_ELLIPSIS|DT_SINGLELINE)
 	if file != "" {
-		name := filepath.Base(file)
-		drawText(hdc, name, RECT{26, statusY + 22, int32(r.Right - 330), statusY + 45}, TEXT, state.fontSmall, 0)
-		drawText(hdc, metaLine, RECT{26, statusY + 42, int32(r.Right - 330), statusY + 63}, MUTED, state.fontSmall, 0)
+		drawText(hdc, metaLine, RECT{r.Right - 405, statusY - 2, r.Right - 32, statusY + 17}, MUTED, state.fontSmall, DT_END_ELLIPSIS|DT_SINGLELINE|0x00000002)
 	}
 	if out != "" {
-		buttonDraw(hdc, rectFolder, BTN_OPEN_FOLDER, "Открыть папку", SURFACE3, false)
+		drawText(hdc, "Сохранено: "+filepath.Base(out), RECT{52, statusY + 13, r.Right - 410, statusY + 29}, MUTED, state.fontSmall, DT_END_ELLIPSIS|DT_SINGLELINE)
 	}
-
-	// Export progress line
 	if progress > 0 && running {
-		pr := RECT{26, r.Bottom - 9, int32(float64(r.Right-26) * float64(progress) / 100.0), r.Bottom - 5}
-		fill(hdc, pr, ACCENT)
+		prW := int32(float64(r.Right-56) * float64(progress) / 100.0)
+		if prW < 4 {
+			prW = 4
+		}
+		roundRect(hdc, RECT{28, r.Bottom - 4, 28 + prW, r.Bottom - 1}, ACCENT, ACCENT, 2)
 	}
 }
-
 func inputCard(hdc uintptr, r RectF) {
-	rr := RECT{int32(r.x), int32(r.y), int32(r.x + r.w), int32(r.y + r.h)}
-	roundRect(hdc, rr, EDIT_BG, BORDER, 8)
+	x1 := int32(r.x)
+	y1 := int32(r.y)
+	x2 := int32(r.x + r.w)
+	y2 := int32(r.y + r.h)
+	roundRect(hdc, RECT{x1, y1, x2, y2}, EDIT_BG, BORDER, 10)
 }
 
 func buttonDraw(hdc uintptr, r RectF, id int, title string, accent uintptr, filled bool) {
 	state.mu.Lock()
-	disabled := (id == BTN_SAVE || id == BTN_PLAY || id == BTN_RESET || id == BTN_OPEN || id == BTN_MODE_COPY || id == BTN_MODE_EXACT) && (state.currentFile == "" || state.exportRunning)
+	disabled := false
 	if id == BTN_OPEN {
 		disabled = state.exportRunning
-	}
-	if id == BTN_MODE_COPY || id == BTN_MODE_EXACT {
-		disabled = state.exportRunning || state.currentFile == ""
-	}
-	if id == BTN_OPEN_FOLDER && (state.lastOutput == "" || state.exportRunning) {
-		disabled = true
+	} else if id == BTN_SAVE || id == BTN_PLAY || id == BTN_RESET {
+		disabled = state.currentFile == "" || state.exportRunning
+	} else if id == BTN_MODE_COPY || id == BTN_MODE_EXACT {
+		disabled = state.currentFile == "" || state.exportRunning
+	} else if id == BTN_OPEN_FOLDER {
+		disabled = state.lastOutput == "" || state.exportRunning
 	}
 	state.mu.Unlock()
-	h := state.hover == id && !disabled
+
+	hovered := state.hover == id && !disabled
+	pressed := state.pressed == id && !disabled
 	var fillC uintptr = SURFACE3
 	var borderC uintptr = BORDER
 	var textC uintptr = TEXT
 	if disabled {
 		fillC, borderC, textC = SURFACE, BORDER, MUTED
-	}
-	if filled && !disabled {
-		fillC = accent
-		borderC = accent
-		textC = BG
-	} else if h {
-		fillC = 0x0043362A
+	} else if filled {
+		fillC, borderC, textC = accent, accent, BG
+		if hovered {
+			fillC = ACCENT_HOVER
+		}
+		if pressed {
+			fillC = ACCENT_PRESSED
+		}
+	} else if hovered {
+		fillC, borderC = SURFACE3, accent
+		if pressed {
+			fillC = SURFACE2
+		}
 	}
 	rr := RECT{int32(r.x), int32(r.y), int32(r.x + r.w), int32(r.y + r.h)}
-	roundRect(hdc, rr, fillC, borderC, 9)
-	flags := int32(0x00000001 | 0x00000100 | 0x00000020)
-	drawText(hdc, title, rr, textC, state.fontButton, flags)
+	// One-pixel lower shadow creates depth without external UI libraries.
+	if !disabled && !pressed {
+		roundRect(hdc, RECT{rr.Left, rr.Top + 2, rr.Right, rr.Bottom + 2}, BLACK, BLACK, 12)
+	}
+	roundRect(hdc, rr, fillC, borderC, 12)
+	drawText(hdc, title, rr, textC, state.fontButton, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
 }
 
 func modeGroupDraw(hdc uintptr, r RectF, exact bool) {
 	rr := RECT{int32(r.x), int32(r.y), int32(r.x + r.w), int32(r.y + r.h)}
-	roundRect(hdc, rr, SURFACE, BORDER, 10)
+	roundRect(hdc, rr, SURFACE2, BORDER, 12)
 	mid := rr.Left + (rr.Right-rr.Left)/2
-	var leftFill, rightFill uintptr = SURFACE, SURFACE
+	var leftFill, rightFill uintptr = SURFACE2, SURFACE2
 	var leftBorder, rightBorder uintptr = BORDER, BORDER
 	if !exact {
-		leftFill, leftBorder = 0x00252115, ACCENT
+		leftFill, leftBorder = 0x00212923, ACCENT
 	} else {
-		rightFill, rightBorder = 0x002B211A, ORANGE
+		rightFill, rightBorder = 0x00242620, ORANGE
 	}
 	if state.hover == BTN_MODE_COPY {
 		leftBorder = ACCENT
@@ -935,14 +1059,13 @@ func modeGroupDraw(hdc uintptr, r RectF, exact bool) {
 	if state.hover == BTN_MODE_EXACT {
 		rightBorder = ORANGE
 	}
-	roundRect(hdc, RECT{rr.Left + 2, rr.Top + 2, mid, rr.Bottom - 2}, leftFill, leftBorder, 8)
-	roundRect(hdc, RECT{mid, rr.Top + 2, rr.Right - 2, rr.Bottom - 2}, rightFill, rightBorder, 8)
-	drawText(hdc, "Без перекодирования", RECT{rr.Left + 7, rr.Top + 7, mid - 6, rr.Top + 28}, TEXT, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, "Быстро · исходное качество", RECT{rr.Left + 7, rr.Top + 30, mid - 6, rr.Bottom - 5}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, "Точная обрезка", RECT{mid + 6, rr.Top + 7, rr.Right - 7, rr.Top + 28}, TEXT, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
-	drawText(hdc, "По кадру · перекодирование", RECT{mid + 6, rr.Top + 30, rr.Right - 7, rr.Bottom - 5}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	roundRect(hdc, RECT{rr.Left + 2, rr.Top + 2, mid, rr.Bottom - 2}, leftFill, leftBorder, 9)
+	roundRect(hdc, RECT{mid, rr.Top + 2, rr.Right - 2, rr.Bottom - 2}, rightFill, rightBorder, 9)
+	drawText(hdc, "БЫСТРО", RECT{rr.Left + 8, rr.Top + 7, mid - 8, rr.Top + 27}, TEXT, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, "Без перекодирования", RECT{rr.Left + 8, rr.Top + 28, mid - 8, rr.Bottom - 5}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS)
+	drawText(hdc, "ТОЧНО", RECT{mid + 8, rr.Top + 7, rr.Right - 8, rr.Top + 27}, TEXT, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, "Кадр в точке", RECT{mid + 8, rr.Top + 28, rr.Right - 8, rr.Bottom - 5}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
 }
-
 func metaLineFromMeta(m Meta) string {
 	var vcodec, acodec string
 	w, h := 0, 0
@@ -1038,7 +1161,104 @@ func initDWM(hwnd uintptr) {
 	procDwmSetWindowAttribute.Call(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, uintptr(unsafe.Pointer(&corners)), unsafe.Sizeof(corners))
 }
 
+func selfTest(input string) error {
+	info, err := os.Stat(input)
+	if err != nil || info.IsDir() {
+		return fmt.Errorf("input test video is missing")
+	}
+	if !strings.EqualFold(filepath.Ext(input), ".mp4") {
+		return fmt.Errorf("self-test input must be MP4")
+	}
+	m, err := probeVideo(input)
+	if err != nil {
+		return fmt.Errorf("probe failed: %w", err)
+	}
+	duration, err := strconv.ParseFloat(m.Format.Duration, 64)
+	if err != nil || duration <= 0 {
+		return fmt.Errorf("invalid duration")
+	}
+
+	clip := math.Min(2.0, duration/2.0)
+	start := math.Min(0.5, duration-clip-0.05)
+	if clip < 0.5 || start < 0 || start+clip > duration+0.001 {
+		return fmt.Errorf("test video is too short")
+	}
+
+	root := filepath.Join(os.TempDir(), fmt.Sprintf("VideoTrimmerSelfTest_%d", time.Now().UnixNano()))
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+
+	preview := filepath.Join(root, "preview.bmp")
+	ffmpeg := toolPath("ffmpeg.exe")
+	ffprobe := toolPath("ffprobe.exe")
+
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", formatTime(start), "-i", input, "-frames:v", "1", "-an", "-f", "image2", "-c:v", "bmp", "-y", preview)
+	hideConsole(cmd)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("preview extraction failed: %w", err)
+	}
+	if st, err := os.Stat(preview); err != nil || st.Size() < 1024 {
+		return fmt.Errorf("preview frame was not created")
+	}
+
+	exactOut := filepath.Join(root, "exact.mp4")
+	copyOut := filepath.Join(root, "copy.mp4")
+	for exact, out := range map[bool]string{true: exactOut, false: copyOut} {
+		args := buildExportArgs(input, out+".part.mp4", start, clip, exact, false)
+		cmd := exec.Command(ffmpeg, args...)
+		hideConsole(cmd)
+		if outErr := cmd.Run(); outErr != nil {
+			return fmt.Errorf("%s export failed: %w", map[bool]string{true: "exact", false: "copy"}[exact], outErr)
+		}
+		if err := os.Rename(out+".part.mp4", out); err != nil {
+			return fmt.Errorf("%s export rename failed: %w", map[bool]string{true: "exact", false: "copy"}[exact], err)
+		}
+		if st, err := os.Stat(out); err != nil || st.Size() < 1024 {
+			return fmt.Errorf("%s export is missing or empty", map[bool]string{true: "exact", false: "copy"}[exact])
+		}
+	}
+
+	probeExact := exec.Command(ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", exactOut)
+	hideConsole(probeExact)
+	probeOut, err := probeExact.Output()
+	if err != nil {
+		return fmt.Errorf("exact output probe failed: %w", err)
+	}
+	got, err := strconv.ParseFloat(strings.TrimSpace(string(probeOut)), 64)
+	if err != nil || math.Abs(got-clip) > 0.20 {
+		return fmt.Errorf("exact duration mismatch: got %.3f expected %.3f", got, clip)
+	}
+	return nil
+}
+
+func buildExportArgs(input, tmp string, start, duration float64, exact, withProgress bool) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	if exact {
+		args = append(args, "-i", input, "-ss", formatTime(start), "-t", formatTime(duration), "-map", "0:v:0?", "-map", "0:a?", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "0", "-movflags", "+faststart")
+	} else {
+		args = append(args, "-ss", formatTime(start), "-i", input, "-t", formatTime(duration), "-map", "0:v:0?", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy", "-avoid_negative_ts", "make_zero", "-map_metadata", "0")
+	}
+	if withProgress {
+		return append(args, "-progress", "pipe:1", "-nostats", "--", tmp)
+	}
+	return append(args, "--", tmp)
+}
+
 func main() {
+	if len(os.Args) > 1 && strings.EqualFold(os.Args[1], "--self-test") {
+		if len(os.Args) < 3 {
+			os.Exit(2)
+		}
+		if err := ensureTools(); err != nil {
+			os.Exit(3)
+		}
+		if err := selfTest(os.Args[2]); err != nil {
+			os.Exit(4)
+		}
+		os.Exit(0)
+	}
 	procSetThreadDpiAwarenessContext.Call(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
 	if err := ensureTools(); err != nil {
 		message("Не найден встроенный FFmpeg.\n\nПрограмма ищет FFmpeg рядом с VideoTrimmer.exe в: bin\\, runtime\\bin\\, вложенной папке runtime\\*\\bin\\ или runtime\\ffmpeg-runtime.zip.\n\nУбедитесь, что portable-архив распакован целиком.", "Неполный portable-дистрибутив", MB_ICONERROR|MB_OK)
@@ -1049,7 +1269,7 @@ func main() {
 	registerClass("VideoTrimmerTimeline", syscall.NewCallback(timelineWndProc), SURFACE)
 	registerClass("VideoTrimmerPreview", syscall.NewCallback(previewWndProc), SURFACE2)
 
-	hwnd := createWindow("VideoTrimmerMain", appName, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_CLIPCHILDREN, 0, 120, 80, 1180, 780, 0, 0, 0)
+	hwnd := createWindow("VideoTrimmerMain", appName, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_CLIPCHILDREN, 0, 120, 80, 1240, 820, 0, 0, 0)
 	state.main = hwnd
 	initDWM(hwnd)
 	buildUI(hwnd)
@@ -1097,8 +1317,8 @@ func mainWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case WM_SIZE:
 		w := int32(int16(loword(lParam)))
 		h := int32(int16(hiword(lParam)))
-		if w < 980 || h < 680 {
-			procSetWindowPos.Call(hwnd, 0, 0, 0, 1000, 720, SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE)
+		if w < 1120 || h < 760 {
+			procSetWindowPos.Call(hwnd, 0, 0, 0, 1120, 760, SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE)
 			return 0
 		}
 		layoutUI(hwnd, w, h)
@@ -1112,7 +1332,9 @@ func mainWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			return 1
 		}
 	case WM_LBUTTONDOWN:
-		handleMainClick(xFromLParam(lParam), yFromLParam(lParam))
+		px, py := xFromLParam(lParam), yFromLParam(lParam)
+		state.pressed = state.hover
+		handleMainClick(px, py)
 		return 0
 	case WM_LBUTTONUP:
 		state.pressed = 0
@@ -1176,6 +1398,7 @@ func mainWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		procDestroyWindow.Call(hwnd)
 		return 0
 	case WM_DESTROY:
+		clearPreviewBitmap()
 		if state.editBrush != 0 {
 			procDeleteObject.Call(state.editBrush)
 		}
@@ -1287,6 +1510,10 @@ func openVideoPath(path string) {
 	}
 	stopPlayer()
 	state.mu.Lock()
+	state.previewGeneration++
+	state.previewRequest++
+	generation := state.previewGeneration
+	request := state.previewRequest
 	state.currentFile = path
 	state.metaLine = metaLineFromMeta(m)
 	state.duration = d
@@ -1297,13 +1524,84 @@ func openVideoPath(path string) {
 	state.status = "Видео готово к обрезке"
 	state.progress = 0
 	state.playing = false
+	state.playStartedAt = time.Time{}
+	state.playBase = 0
 	state.mu.Unlock()
+	clearPreviewBitmap()
 	setText(state.startEdit, formatTime(0))
 	setText(state.endEdit, formatTime(d))
-	startPlayer(path, 0, true)
+	postStatus("Готовлю кадр предпросмотра…")
+	go generatePreviewFrame(path, generation, request, 0)
+	// Do not start ffplay while opening the file. The first frame appears
+	// immediately when it is ready; playback starts only after the user presses Play.
 	procInvalidateRect.Call(state.main, 0, 1)
 	procInvalidateRect.Call(state.preview, 0, 1)
 	refreshTimeline()
+}
+
+func clearPreviewBitmap() {
+	state.previewMu.Lock()
+	bmp := state.previewBitmap
+	state.previewBitmap = 0
+	if bmp != 0 {
+		procDeleteObject.Call(bmp)
+	}
+	state.previewMu.Unlock()
+}
+
+func setPreviewBitmap(bmp uintptr, generation, request uint64, path string) {
+	state.mu.Lock()
+	if generation != state.previewGeneration || request != state.previewRequest || path != state.currentFile {
+		state.mu.Unlock()
+		if bmp != 0 {
+			procDeleteObject.Call(bmp)
+		}
+		return
+	}
+	state.previewMu.Lock()
+	old := state.previewBitmap
+	state.previewBitmap = bmp
+	if old != 0 {
+		procDeleteObject.Call(old)
+	}
+	state.previewMu.Unlock()
+	state.mu.Unlock()
+	procInvalidateRect.Call(state.preview, 0, 1)
+	postStatus("Предпросмотр готов — нажмите «Пуск»")
+}
+
+func generatePreviewFrame(path string, generation, request uint64, at float64) {
+	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("VideoTrimmerPreview_%d_%d.bmp", os.Getpid(), time.Now().UnixNano()))
+	defer os.Remove(tmp)
+	ffmpeg := toolPath("ffmpeg.exe")
+	// Seek before decoding for a responsive thumbnail. The operation is asynchronous,
+	// so opening/dragging the timeline never blocks the UI thread.
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", formatTime(at), "-i", path, "-frames:v", "1", "-an", "-f", "image2", "-c:v", "bmp", "-y", tmp)
+	hideConsole(cmd)
+	if err := cmd.Run(); err != nil {
+		return
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		return
+	}
+	bmp, _, _ := procLoadImage.Call(0, uintptr(unsafe.Pointer(utf16Ptr(tmp))), IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE|LR_CREATEDIBSECTION)
+	if bmp == 0 {
+		return
+	}
+	setPreviewBitmap(bmp, generation, request, path)
+}
+
+func requestPreview(path string, at float64) {
+	state.mu.Lock()
+	if path == "" || path != state.currentFile {
+		state.mu.Unlock()
+		return
+	}
+	state.previewRequest++
+	generation := state.previewGeneration
+	request := state.previewRequest
+	state.mu.Unlock()
+	go generatePreviewFrame(path, generation, request, at)
 }
 
 func hideConsole(cmd *exec.Cmd) {
@@ -1350,10 +1648,13 @@ func parseTimeText(s string) (float64, error) {
 	if len(p) != 3 {
 		return 0, fmt.Errorf("time must HH:MM:SS.mmm")
 	}
-	h, _ := strconv.Atoi(p[0])
-	m, _ := strconv.Atoi(p[1])
-	sec, _ := strconv.ParseFloat(p[2], 64)
-	if h < 0 || m < 0 || m >= 60 || sec < 0 || sec >= 60 {
+	h, errH := strconv.Atoi(p[0])
+	m, errM := strconv.Atoi(p[1])
+	sec, errS := strconv.ParseFloat(p[2], 64)
+	if errH != nil || errM != nil || errS != nil {
+		return 0, fmt.Errorf("bad time")
+	}
+	if h < 0 || m < 0 || m >= 60 || sec < 0 || sec >= 60 || math.IsNaN(sec) || math.IsInf(sec, 0) {
 		return 0, fmt.Errorf("bad time")
 	}
 	return float64(h*3600+m*60) + sec, nil
@@ -1376,6 +1677,9 @@ func parseEdits(showErr bool) bool {
 	en, e2 := parseTimeText(getText(state.endEdit))
 	state.mu.Lock()
 	d := state.duration
+	current := state.current
+	playing := state.playing
+	file := state.currentFile
 	state.mu.Unlock()
 	if e1 != nil || e2 != nil || st < 0 || en <= st || en > d {
 		if showErr {
@@ -1383,13 +1687,26 @@ func parseEdits(showErr bool) bool {
 		}
 		return false
 	}
+
+	previewAt := -1.0
 	state.mu.Lock()
 	state.start = st
 	state.end = en
-	if state.current < st || state.current > en {
+	if current < st {
 		state.current = st
+		state.playBase = st
+		previewAt = st
+	} else if current > en {
+		state.current = en
+		state.playBase = en
+		previewAt = en
 	}
+	playing = state.playing
+	file = state.currentFile
 	state.mu.Unlock()
+	if !playing && previewAt >= 0 && file != "" {
+		requestPreview(file, previewAt)
+	}
 	refreshTimeline()
 	return true
 }
@@ -1415,42 +1732,63 @@ func refreshTimeline() {
 	if state.timeline != 0 {
 		procInvalidateRect.Call(state.timeline, 0, 0)
 	}
+	ended := false
 	state.mu.Lock()
-	t, d, st, en, playing := state.current, state.duration, state.start, state.end, state.playing
+	if state.playing && !state.playStartedAt.IsZero() {
+		cur := state.playBase + time.Since(state.playStartedAt).Seconds()
+		if state.end > state.start && cur >= state.end {
+			cur = state.end
+			state.current = cur
+			state.playing = false
+			state.playStartedAt = time.Time{}
+			state.playBase = cur
+			ended = true
+		} else {
+			if state.duration > 0 && cur > state.duration {
+				cur = state.duration
+			}
+			state.current = cur
+		}
+	}
+	st, en := state.start, state.end
 	state.mu.Unlock()
-	_ = st
-	_ = en
+	if ended {
+		stopPlayer()
+		state.mu.Lock()
+		f := state.currentFile
+		state.mu.Unlock()
+		if f != "" {
+			requestPreview(f, en)
+		}
+	}
 	procInvalidateRect.Call(state.main, 0, 0)
 	focus, _, _ := procGetFocus.Call()
 	if focus != state.startEdit && focus != state.endEdit {
 		setText(state.startEdit, formatTime(st))
 		setText(state.endEdit, formatTime(en))
 	}
-	if d > 0 {
-		_ = t / d
-	}
-	_ = playing
 }
-
 func togglePlayback() {
 	state.mu.Lock()
 	if state.exportRunning {
 		state.mu.Unlock()
 		return
 	}
-	f, t := state.currentFile, state.current
+	f, t, st, en := state.currentFile, state.current, state.start, state.end
+	was := state.playing
 	if f == "" {
 		state.mu.Unlock()
 		return
 	}
-	was := state.playing
-	state.playing = !was
-	now := state.playing
+	if !was && en > st && t >= en-0.02 {
+		t = st
+		state.current = t
+		state.playBase = t
+	}
 	state.mu.Unlock()
-	startPlayer(f, t, !now)
+	startPlayer(f, t, was)
 	procInvalidateRect.Call(state.main, 0, 0)
 }
-
 func seekTo(t float64) {
 	state.mu.Lock()
 	f := state.currentFile
@@ -1462,13 +1800,15 @@ func seekTo(t float64) {
 		t = state.duration
 	}
 	state.current = t
+	state.playBase = t
 	state.mu.Unlock()
-	if f != "" {
-		startPlayer(f, t, !playing)
+	if playing {
+		startPlayer(f, t, false)
+	} else if f != "" {
+		requestPreview(f, t)
 	}
 	refreshTimeline()
 }
-
 func startPlayer(path string, start float64, paused bool) {
 	state.playerMu.Lock()
 	defer state.playerMu.Unlock()
@@ -1483,7 +1823,12 @@ func startPlayer(path string, start float64, paused bool) {
 		return
 	}
 	windowTitle := fmt.Sprintf("Video Trimmer Preview %d", time.Now().UnixNano())
-	args := []string{"-hide_banner", "-loglevel", "error", "-window_title", windowTitle, "-noborder", "-x", "640", "-y", "360", "-ss", formatTime(start), "-autoexit"}
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-window_title", windowTitle, "-noborder",
+		"-sn", "-dn", "-x", "960", "-y", "540",
+		"-ss", formatTime(start), "-autoexit",
+	}
 	if paused {
 		args = append(args, "-initial_pause", "1")
 	}
@@ -1499,40 +1844,50 @@ func startPlayer(path string, start float64, paused bool) {
 	}
 	state.player = cmd
 	state.playerWindow = 0
+	state.mu.Lock()
+	state.playBase = start
+	if paused {
+		state.playing = false
+		state.playStartedAt = time.Time{}
+	} else {
+		state.playing = true
+		state.playStartedAt = time.Now()
+	}
+	state.mu.Unlock()
+
 	go func(c *exec.Cmd) {
-		err := c.Wait()
-		_ = err
+		_ = c.Wait()
 		state.playerMu.Lock()
 		if state.player == c {
 			state.player = nil
 			state.playerWindow = 0
 			state.mu.Lock()
 			state.playing = false
-			if state.duration > 0 && state.current > state.duration {
-				state.current = state.duration
-			}
+			state.playStartedAt = time.Time{}
+			state.playBase = state.current
 			state.mu.Unlock()
 			procInvalidateRect.Call(state.main, 0, 0)
 		}
 		state.playerMu.Unlock()
 	}(cmd)
-	if paused {
-		// ffplay does not provide a stable paused-start flag; the editor uses its own play state.
-		state.mu.Lock()
-		state.playing = false
-		state.mu.Unlock()
-	}
+
 	go func(title string, c *exec.Cmd) {
-		for i := 0; i < 40; i++ {
+		for i := 0; i < 60; i++ {
 			time.Sleep(50 * time.Millisecond)
 			h, _, _ := procFindWindow.Call(0, uintptr(unsafe.Pointer(utf16Ptr(title))))
 			if h != 0 {
+				shouldEmbed := false
 				state.playerMu.Lock()
 				if state.player == c {
 					state.playerWindow = h
-					embedPlayerWindow(h)
+					shouldEmbed = true
 				}
 				state.playerMu.Unlock()
+				// embedPlayerWindow/resizePlayerWindow also use playerMu, so never
+				// call them while playerMu is held (non-reentrant mutex).
+				if shouldEmbed {
+					embedPlayerWindow(h)
+				}
 				break
 			}
 		}
@@ -1591,9 +1946,16 @@ func timelineWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 	case WM_LBUTTONUP:
 		state.mu.Lock()
+		drag := timelineDrag
+		t := state.current
+		playing := state.playing
+		f := state.currentFile
 		timelineDrag = 0
 		state.mu.Unlock()
 		procReleaseCapture.Call()
+		if drag != 0 && !playing && f != "" {
+			requestPreview(f, t)
+		}
 		return 0
 	}
 	r, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
@@ -1629,6 +1991,7 @@ func timelineTimeFromX(hwnd uintptr, x int32) float64 {
 func handleTimelineMouse(hwnd uintptr, x int32, down bool) {
 	state.mu.Lock()
 	d, st, en := state.duration, state.start, state.end
+	wasPlaying := false
 	state.mu.Unlock()
 	if d <= 0 {
 		return
@@ -1647,6 +2010,17 @@ func handleTimelineMouse(hwnd uintptr, x int32, down bool) {
 		} else {
 			timelineDrag = 3
 		}
+		state.mu.Lock()
+		if state.playing {
+			wasPlaying = true
+			state.playing = false
+			state.playStartedAt = time.Time{}
+			state.playBase = state.current
+		}
+		state.mu.Unlock()
+		if wasPlaying {
+			stopPlayer()
+		}
 	}
 	if timelineDrag == 1 {
 		t := timelineTimeFromX(hwnd, x)
@@ -1659,6 +2033,7 @@ func handleTimelineMouse(hwnd uintptr, x int32, down bool) {
 		state.mu.Lock()
 		state.start = t
 		state.current = t
+		state.playBase = t
 		state.mu.Unlock()
 		setText(state.startEdit, formatTime(t))
 		refreshTimeline()
@@ -1674,6 +2049,7 @@ func handleTimelineMouse(hwnd uintptr, x int32, down bool) {
 		state.mu.Lock()
 		state.end = t
 		state.current = t
+		state.playBase = t
 		state.mu.Unlock()
 		setText(state.endEdit, formatTime(t))
 		refreshTimeline()
@@ -1681,13 +2057,15 @@ func handleTimelineMouse(hwnd uintptr, x int32, down bool) {
 	if timelineDrag == 3 {
 		t := timelineTimeFromX(hwnd, x)
 		state.mu.Lock()
-		state.current = t
-		playing := state.playing
-		f := state.currentFile
-		state.mu.Unlock()
-		if !playing && f != "" {
-			startPlayer(f, t, true)
+		if t < state.start {
+			t = state.start
 		}
+		if t > state.end {
+			t = state.end
+		}
+		state.current = t
+		state.playBase = t
+		state.mu.Unlock()
 		refreshTimeline()
 	}
 }
@@ -1708,17 +2086,27 @@ func drawTimeline(hwnd uintptr) {
 	state.mu.Lock()
 	d, st, en, cur := state.duration, state.start, state.end, state.current
 	state.mu.Unlock()
-	drawText(hdc, "ОБРЕЗКА", RECT{26, 14, 120, 34}, MUTED, state.fontSmall, 0)
-	drawText(hdc, formatTime(st), RECT{120, 14, 250, 34}, TEXT, state.fontMono, 0)
-	drawText(hdc, "—", RECT{250, 14, 270, 34}, MUTED, state.fontSmall, 0)
-	drawText(hdc, formatTime(en), RECT{270, 14, 400, 34}, TEXT, state.fontMono, 0)
-	drawText(hdc, formatTime(cur)+" / "+formatTime(d), RECT{r.Right - 210, 14, r.Right - 26, 34}, MUTED, state.fontSmall, 0x00000002|DT_SINGLELINE)
-	pad := 34.0
+
+	// Compact time chips.
+	roundRect(hdc, RECT{16, 12, 136, 44}, EDIT_BG, BORDER, 10)
+	roundRect(hdc, RECT{146, 12, 266, 44}, EDIT_BG, BORDER, 10)
+	drawText(hdc, formatTime(st), RECT{22, 13, 130, 31}, TEXT, state.fontMono, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, formatTime(en), RECT{152, 13, 260, 31}, TEXT, state.fontMono, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, "НАЧАЛО", RECT{22, 29, 130, 43}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+	drawText(hdc, "КОНЕЦ", RECT{152, 29, 260, 43}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+
+	drawText(hdc, formatTime(cur)+"  /  "+formatTime(d), RECT{r.Right - 224, 12, r.Right - 24, 34}, MUTED, state.fontSmall, DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+
+	pad := 282.0
 	x0 := pad
-	x1 := float64(r.Right) - pad
-	y := 64.0
+	x1 := float64(r.Right) - 34
+	if x1 < x0+100 {
+		x0 = 20
+		x1 = float64(r.Right) - 20
+	}
+	y := 62.0
 	track := RECT{int32(x0), int32(y - 5), int32(x1), int32(y + 5)}
-	roundRect(hdc, track, 0x002B3947, 0x002B3947, 6)
+	roundRect(hdc, track, 0x002A3440, 0x002A3440, 6)
 	if d > 0 {
 		sx := x0 + (x1-x0)*st/d
 		ex := x0 + (x1-x0)*en/d
@@ -1728,7 +2116,7 @@ func drawTimeline(hwnd uintptr) {
 		}
 		for i := 0; i <= 4; i++ {
 			tx := x0 + (x1-x0)*float64(i)/4
-			line(hdc, int32(tx), 78, int32(tx), 85, 0x00333F4C, 1)
+			line(hdc, int32(tx), 77, int32(tx), 83, 0x00353F4B, 1)
 		}
 		hb := createBrush(TEXT)
 		procSelectObject.Call(hdc, hb)
@@ -1781,6 +2169,29 @@ func saveVideo() {
 	go runExport(f, out, st, en, exact)
 }
 
+func replaceOutputFile(tmp, output string) error {
+	// Windows os.Rename does not replace an existing file. The save dialog already
+	// asks for overwrite confirmation, so replace the old output only after the
+	// new file has been produced successfully. Keep a tiny rollback path if the
+	// final rename fails.
+	backup := output + ".old"
+	_ = os.Remove(backup)
+	if _, err := os.Stat(output); err == nil {
+		if err := os.Rename(output, backup); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(tmp, output); err != nil {
+		_ = os.Remove(output)
+		if _, restoreErr := os.Stat(backup); restoreErr == nil {
+			_ = os.Rename(backup, output)
+		}
+		return err
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
 func runExport(input, output string, start, end float64, exact bool) {
 	ffmpeg := toolPath("ffmpeg.exe")
 	if _, err := os.Stat(ffmpeg); err != nil {
@@ -1792,14 +2203,8 @@ func runExport(input, output string, start, end float64, exact bool) {
 		postFinish("Некорректная длительность фрагмента.")
 		return
 	}
-	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
-	if exact {
-		args = append(args, "-i", input, "-ss", formatTime(start), "-t", formatTime(duration), "-map", "0:v:0?", "-map", "0:a?", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "0", "-movflags", "+faststart")
-	} else {
-		args = append(args, "-ss", formatTime(start), "-i", input, "-t", formatTime(duration), "-map", "0:v:0?", "-map", "0:a?", "-c:v", "copy", "-c:a", "copy", "-avoid_negative_ts", "make_zero", "-map_metadata", "0")
-	}
 	tmp := output + ".part.mp4"
-	args = append(args, "-progress", "pipe:1", "-nostats", "--", tmp)
+	args := buildExportArgs(input, tmp, start, duration, exact, true)
 	cmd := exec.Command(ffmpeg, args...)
 	hideConsole(cmd)
 	stdout, err := cmd.StdoutPipe()
@@ -1839,7 +2244,7 @@ func runExport(input, output string, start, end float64, exact bool) {
 		postFinish("Не удалось сохранить видео. Проверьте исходный файл и свободное место.")
 		return
 	}
-	if err := os.Rename(tmp, output); err != nil {
+	if err := replaceOutputFile(tmp, output); err != nil {
 		_ = os.Remove(tmp)
 		postFinish("Не удалось завершить сохранение файла.")
 		return
