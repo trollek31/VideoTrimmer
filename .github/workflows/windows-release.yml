@@ -21,11 +21,19 @@ jobs:
           go-version: '1.23.x'
           cache: false
 
+      - name: Run Go tests
+        shell: pwsh
+        run: go test ./...
+
+      - name: Run Go vet
+        shell: pwsh
+        run: go vet ./...
+
       - name: Build portable package
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 
-      - name: Smoke-test runtime and app
+      - name: Smoke-test runtime and application
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -40,11 +48,20 @@ jobs:
           if (-not $ffmpeg -or -not $ffprobe -or -not $ffplay) { throw 'Portable runtime is missing FFmpeg/FFprobe/FFplay.' }
           & $ffmpeg.FullName -hide_banner -version
           if ($LASTEXITCODE -ne 0) { throw 'FFmpeg failed to start.' }
+
           $test = "$env:RUNNER_TEMP\videotrimmer-test.mp4"
-          $copy = "$env:RUNNER_TEMP\videotrimmer-copy.mp4"
-          $exact = "$env:RUNNER_TEMP\videotrimmer-exact.mp4"
           & $ffmpeg.FullName -y -f lavfi -i "testsrc2=size=640x360:rate=30" -f lavfi -i "sine=frequency=1000:sample_rate=48000" -t 5 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest $test
           if ($LASTEXITCODE -ne 0) { throw 'Failed to generate test MP4.' }
+
+          # Validate the actual application's runtime lookup, probing, preview-frame
+          # extraction and both export paths on a real Windows runner.
+          & "$root\VideoTrimmer.exe" --self-test $test
+          if ($LASTEXITCODE -ne 0) { throw "VideoTrimmer self-test failed with exit code $LASTEXITCODE." }
+
+          # Keep a direct FFmpeg smoke test too, so the release still gets a clear
+          # failure signal if a future runtime update breaks the codec tool itself.
+          $copy = "$env:RUNNER_TEMP\videotrimmer-copy.mp4"
+          $exact = "$env:RUNNER_TEMP\videotrimmer-exact.mp4"
           & $ffmpeg.FullName -y -ss 1 -i $test -t 2 -c copy -avoid_negative_ts make_zero $copy
           if ($LASTEXITCODE -ne 0) { throw 'Stream-copy trim failed.' }
           & $ffmpeg.FullName -y -ss 1 -i $test -t 2 -c:v libx264 -preset veryfast -c:a aac $exact
@@ -52,11 +69,12 @@ jobs:
           $probe = & $ffprobe.FullName -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $exact
           $duration = [double]::Parse($probe.Trim(), [Globalization.CultureInfo]::InvariantCulture)
           if ([math]::Abs($duration - 2.0) -gt 0.25) { throw "Exact trim duration check failed: $duration" }
+
           $p = Start-Process -FilePath "$root\VideoTrimmer.exe" -PassThru
           Start-Sleep -Seconds 3
           if ($p.HasExited) { throw 'VideoTrimmer.exe exited immediately.' }
           Stop-Process -Id $p.Id -Force
-          Write-Host 'Smoke test passed.'
+          Write-Host 'Windows smoke test passed.'
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
